@@ -30,7 +30,7 @@ require (
 )
 
 require (
-	github.com/algo2go/kite-mcp-alerts v0.1.0
+	github.com/algo2go/kite-mcp-alerts v0.3.1
 	github.com/algo2go/kite-mcp-domain v0.1.0
 	github.com/algo2go/kite-mcp-logger v0.1.0
 	github.com/algo2go/kite-mcp-oauth v0.1.0

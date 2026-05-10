@@ -138,11 +138,13 @@ CREATE TABLE IF NOT EXISTS billing (
 
 	// Migration: rename billing PK from email to admin_email (idempotent).
 	// Check if admin_email column already exists — if so, migration is done.
-	var colCount int
-	if row := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('billing') WHERE name='admin_email'`); row != nil {
-		_ = row.Scan(&colCount)
-	}
-	if colCount == 0 {
+	//
+	// Phase 2.1.6: routes through s.db.ColumnExists (dialect-portable
+	// wrapper from kite-mcp-alerts v0.3.1) so this migration probe works
+	// on both SQLite (pragma_table_info) and Postgres (information_schema.columns)
+	// once the Postgres adapter lands in Phase 2.2.
+	hasAdminEmail, _ := s.db.ColumnExists("billing", "admin_email")
+	if !hasAdminEmail {
 		// Table rebuild: email → admin_email. Pre-rebuild rows had no
 		// monthly_amount; default to 0 (Free / unset) so the rebuilt
 		// table is well-formed and Slice 4's REAL boundary stays consistent
@@ -158,18 +160,38 @@ CREATE TABLE IF NOT EXISTS billing (
 			max_users          INTEGER NOT NULL DEFAULT 1,
 			monthly_amount     REAL NOT NULL DEFAULT 0
 		)`)
-		// NOTE: this self-migration uses INSERT OR IGNORE rather than the
-		// portable ON CONFLICT form because the source `billing` table
-		// here has the LEGACY schema (`email` PK, no `max_users` column),
-		// and SQLite's INSERT OR IGNORE swallows the resulting "no such
-		// column" / row-shape errors silently — preserving the migration
-		// flow when the old schema is partial. ON CONFLICT (col) DO
-		// NOTHING only silences UNIQUE-conflict failures, not column-
-		// resolution errors. Phase 2.1.6 (dialect helper) will branch
-		// this path explicitly: SQLite keeps INSERT OR IGNORE; Postgres
-		// will use a proper schema-introspection guard before the SELECT.
-		// Per kite-mcp-server Phase 2.1 audit (commit da91a39).
-		_ = s.db.ExecDDL(`INSERT OR IGNORE INTO billing_mig (admin_email, tier, stripe_customer_id, stripe_sub_id, status, expires_at, updated_at, max_users, monthly_amount) SELECT email, tier, stripe_customer_id, stripe_sub_id, status, expires_at, updated_at, COALESCE(max_users, 1), 0 FROM billing`)
+		// Phase 2.1.6 cross-repo edit: this self-migration formerly used
+		// SQLite's INSERT OR IGNORE to silently swallow potential row
+		// conflicts when copying legacy rows into billing_mig. Two
+		// empirical findings during Phase 2.1.6 reshaped the approach:
+		//
+		// (1) SQLite does NOT accept ON CONFLICT after INSERT INTO ...
+		//     SELECT ... — the upsert-clause grammar applies only to
+		//     INSERT ... VALUES (...). Postgres accepts it on both
+		//     forms; SQLite only on the VALUES form. So ON CONFLICT
+		//     can't be the portable fallback for the SELECT form.
+		//
+		// (2) billing_mig is FRESHLY created by the line above (CREATE
+		//     TABLE IF NOT EXISTS billing_mig), so the destination is
+		//     empty and admin_email PK conflicts are impossible during
+		//     this insert. INSERT OR IGNORE's idempotency was
+		//     defense-in-depth, not load-bearing.
+		//
+		// The portable approach is therefore PLAIN INSERT INTO ...
+		// SELECT ... with no upsert clause. We probe the source schema
+		// with ColumnExists (kite-mcp-alerts v0.3.1 dialect helper) to
+		// discover which optional columns the legacy table has, then
+		// emit the SELECT with COALESCE/literals matched to that shape
+		// so column-resolution succeeds on both dialects.
+		hasMaxUsers, _ := s.db.ColumnExists("billing", "max_users")
+		var migrateSelect string
+		if hasMaxUsers {
+			migrateSelect = `SELECT email, tier, stripe_customer_id, stripe_sub_id, status, expires_at, updated_at, COALESCE(max_users, 1), 0 FROM billing`
+		} else {
+			// Legacy schema: max_users column doesn't exist; use literal 1.
+			migrateSelect = `SELECT email, tier, stripe_customer_id, stripe_sub_id, status, expires_at, updated_at, 1, 0 FROM billing`
+		}
+		_ = s.db.ExecDDL(`INSERT INTO billing_mig (admin_email, tier, stripe_customer_id, stripe_sub_id, status, expires_at, updated_at, max_users, monthly_amount) ` + migrateSelect)
 		_ = s.db.ExecDDL(`DROP TABLE billing`)
 		_ = s.db.ExecDDL(`ALTER TABLE billing_mig RENAME TO billing`)
 	}
