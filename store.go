@@ -158,6 +158,17 @@ CREATE TABLE IF NOT EXISTS billing (
 			max_users          INTEGER NOT NULL DEFAULT 1,
 			monthly_amount     REAL NOT NULL DEFAULT 0
 		)`)
+		// NOTE: this self-migration uses INSERT OR IGNORE rather than the
+		// portable ON CONFLICT form because the source `billing` table
+		// here has the LEGACY schema (`email` PK, no `max_users` column),
+		// and SQLite's INSERT OR IGNORE swallows the resulting "no such
+		// column" / row-shape errors silently — preserving the migration
+		// flow when the old schema is partial. ON CONFLICT (col) DO
+		// NOTHING only silences UNIQUE-conflict failures, not column-
+		// resolution errors. Phase 2.1.6 (dialect helper) will branch
+		// this path explicitly: SQLite keeps INSERT OR IGNORE; Postgres
+		// will use a proper schema-introspection guard before the SELECT.
+		// Per kite-mcp-server Phase 2.1 audit (commit da91a39).
 		_ = s.db.ExecDDL(`INSERT OR IGNORE INTO billing_mig (admin_email, tier, stripe_customer_id, stripe_sub_id, status, expires_at, updated_at, max_users, monthly_amount) SELECT email, tier, stripe_customer_id, stripe_sub_id, status, expires_at, updated_at, COALESCE(max_users, 1), 0 FROM billing`)
 		_ = s.db.ExecDDL(`DROP TABLE billing`)
 		_ = s.db.ExecDDL(`ALTER TABLE billing_mig RENAME TO billing`)
@@ -421,8 +432,10 @@ func (s *Store) MarkEventProcessed(eventID, eventType string) error {
 	if s.db == nil {
 		return nil
 	}
+	// SQL portability: ON CONFLICT (event_id) DO NOTHING is the
+	// dialect-portable form per Phase 2.1 audit.
 	return s.db.ExecInsert(
-		`INSERT OR IGNORE INTO webhook_events (event_id, event_type, created_at) VALUES (?, ?, ?)`,
+		`INSERT INTO webhook_events (event_id, event_type, created_at) VALUES (?, ?, ?) ON CONFLICT (event_id) DO NOTHING`,
 		eventID, eventType, time.Now().Format(time.RFC3339),
 	)
 }
